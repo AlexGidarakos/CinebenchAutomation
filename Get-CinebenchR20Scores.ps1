@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
 Get-CinebenchR20Scores.ps1 - Automated execution of Cinebench R20.
 
@@ -26,6 +26,11 @@ ensure that the temperatures of your CPU, cooling system and chassis after every
 levels. If there is a large fluctuation in the individual scores for each thread count (also indicated by large
 STDEV% values) and there are no other CPU-intensive processes running, try larger values.
 
+.PARAMETER IdleWait
+Number of seconds to wait before first run. Acceptable values are 0-1200 with the default at 0. This is used to
+ensure that the system has settled to an idle state with minimal to no background process activity, especially
+when the script is run shortly after a fresh boot into Windows.
+
 .PARAMETER ExePath
 Path and filename of the Cinebench R20 executable. By default it is assumed to be located in the same directory as
 this script and to have a filename of "Cinebench.exe".
@@ -52,11 +57,11 @@ Same as example 4.
 
 .EXAMPLE
 PS> .\Get-CinebenchScores.ps1 -Runs 5 -Threads 16,4,1 -Cooldown 300
-Runs with 16, 4 and 1 threads, 5 executions each, with a 5min cooldown
+Runs with 16, 4 and 1 threads, 5 executions each, with a 5min cooldown.
 
 .EXAMPLE
-PS> .\Get-CinebenchScores.ps1 5 16,4,1 300
-Same as example 6.
+PS> .\Get-CinebenchScores.ps1 5 16,4,1 300 -IdleWait 600
+Same as example 6, but with an initial wait period of 10mins to settle to idle.
 
 .EXAMPLE
 PS> .\Get-CinebenchScores.ps1 -ExePath "C:\Apps\CB20\Cinebench.exe"
@@ -105,6 +110,14 @@ Param(
         ValueFromPipelineByPropertyName = $false,
         Position = 3
         )]
+    [ValidateRange(0, 1200)]
+    [Int] $IdleWait = 0,
+    [Parameter(
+        Mandatory = $false,
+        ValueFromPipeline = $false,
+        ValueFromPipelineByPropertyName = $false,
+        Position = 4
+        )]
     [String] $ExePath = $PSScriptRoot + "\Cinebench.exe"
 )
 
@@ -133,7 +146,7 @@ BEGIN {
     # More initializations
     $CustomThreadsEnabledOffset = 0x1B2
     $CustomThreadsOffset = 0x1A3
-    $Results = @{}
+    $Results = (1..$Threads.Count)
 
     # Backup initial Cinebench R20 thread preferences to restore at the end of the script
     [Byte[]] $Prefs = Get-Content $PrefsFile -Encoding Byte -ReadCount 0
@@ -145,27 +158,56 @@ BEGIN {
     # cooldown delays are not enough to completely cool down the radiator(s) and the water in the loop. Leaving
     # the low-thread count runs near the end makes sense since they are not as thermally constrained
     $Threads = $Threads | Sort-Object -Descending
+    $ThreadCounter = -1
 }
 
 PROCESS {
+    Function Wait-Period {
+        Param(
+            [Parameter(
+            Mandatory = $true,
+            ValueFromPipeline = $false,
+            ValueFromPipelineByPropertyName = $false,
+            Position = 0
+            )]
+            [Int] $Period
+        )
+    
+        for ($i = $Period; $i -gt 0; $i--) {
+            Write-Progress -Activity "Waiting for $Period seconds" -Status "$i seconds remaining"
+            Start-Sleep -Seconds 1
+        }
+    }
+
+    If ($IdleWait -gt 0 -And $IdleWait -gt $Cooldown) {
+        Write-Host "$IdleWait seconds wait to ensure CPU and OS services are idling"
+        Wait-Period $IdleWait
+    }
+
     ForEach ($ThreadNumber In $Threads) {
+        $ThreadCounter++
         $Prefs[$CustomThreadsOffset] = $ThreadNumber
         Set-Content -Path $PrefsFile -Encoding Byte -Value $Prefs
         $SumOfDiffsSquared = 0.0
-        $ThreadKey = [String]$ThreadNumber
 
-        $Results.Add($ThreadKey, [ordered]@{
+        $Results[$ThreadCounter] = [ordered]@{
+            Threads = $ThreadNumber
             Scores = [Double[]](1..$Runs)
             Average = 0.0
             Minimum = 0.0
             Maximum = 0.0
             StDev   = 0.0
             StDevP  = ""
-        })
+        }
 
         For ($Run = 1; $Run -le $Runs; $Run++) {
-            Write-Host "$ThreadNumber thread(s) - Run $Run/$Runs - $Cooldown seconds cooldown"
-            Timeout $Cooldown
+            If ($Cooldown -gt 0) {
+                If ($Run -gt 1 -Or ($Run -eq 1 -And $Cooldown -gt $IdleWait)) {
+                Write-Host "$ThreadNumber thread(s) - Run $Run/$Runs - $Cooldown seconds cooldown"
+                Wait-Period $Cooldown
+                }
+            }
+
             Write-Host "$ThreadNumber thread(s) - Run $Run/$Runs - Starting"
             $ExeOutput = & $ExePath g_CinebenchCpuXTest=true | Out-String
 
@@ -174,27 +216,25 @@ PROCESS {
                 Exit 3
             }
 
-            $Results[$ThreadKey].Scores[$Run - 1] = $Score = $Matches.Score
+            $Results[$ThreadCounter].Scores[$Run - 1] = $Score = $Matches.Score
             Write-Host "$ThreadNumber thread(s) - Run $Run/$Runs - Completed - Score: $Score"
         }
 
-        $Stats = ($Results[$ThreadKey].Scores | Measure-Object -Minimum -Maximum -Average)
-        $Results[$ThreadKey].Minimum = $Stats.Minimum
-        $Results[$ThreadKey].Maximum = $Stats.Maximum
-        $Results[$ThreadKey].Average = $Stats.Average
+        $Stats = ($Results[$ThreadCounter].Scores | Measure-Object -Minimum -Maximum -Average)
+        $Results[$ThreadCounter].Minimum = $Stats.Minimum
+        $Results[$ThreadCounter].Maximum = $Stats.Maximum
+        $Results[$ThreadCounter].Average = $Stats.Average
 
-        ForEach($Score In $Results[$ThreadKey].Scores) {
-            [Math]::Pow(($Score - $Stats.Average), 2)
+        ForEach($Score In $Results[$ThreadCounter].Scores) {
             $SumOfDiffsSquared += [Math]::Pow(($Score - $Stats.Average), 2)
         }
 
         $Count = $Stats.Count
-        $Results[$ThreadKey].StDev = [Math]::Sqrt($SumOfDiffsSquared / $Count)
-        $Results[$ThreadKey].StDevP = [String]((100 * $Results[$ThreadKey].StDev) / $Stats.Average) + "%"
-        Write-Host "$ThreadNumber thread(s) - $Runs run(s) - Results:"
+        $Results[$ThreadCounter].StDev = [Math]::Sqrt($SumOfDiffsSquared / $Count)
+        $Results[$ThreadCounter].StDevP = [String]((100 * $Results[$ThreadCounter].StDev) / $Stats.Average) + "%"
     }
 
-    Write-Host "Complete results:"
+    Write-Host "Results:"
     $Results | ConvertTo-JSON
 }
 
